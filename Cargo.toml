@@ -1,0 +1,27 @@
+[package]
+name = "render-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.22.1"
+bytes = "1.6.0"
+crossbeam-queue = "0.3.11"
+fantoccini = "0.19.3"
+futures = "0.3.30"
+futures-util = "0.3.30"
+pretty_env_logger = "0.5.0"
+rand = "0.8.5"
+reqwest = "0.12.5"
+serde_json = "1.0.119"
+tokio = { version = "1.38.0", features = [ "full" ] }
+tokio-stream = "0.1.15"
+warp = "0.3.7"
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
