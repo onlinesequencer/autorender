@@ -11,6 +11,7 @@ use fantoccini::{Client, ClientBuilder};
 use std::time::Duration;
 use base64::Engine;
 use bytes::Bytes;
+use clap::Parser;
 use crossbeam_queue::SegQueue;
 use fantoccini::wd::Capabilities;
 use rand::RngCore;
@@ -88,14 +89,31 @@ AudioSystem.prototype.encodeWav = function(left, right) {
 
 const INDEX_HTML: &str = include_str!("index.html");
 
-const RENDER_ADDR: &str = "http://192.168.0.200:3513";
 const DRIVER_ADDR: &str = "http://127.0.0.1";
-const SEQUENCE_ORIGIN: &str = "https://onlinesequencer.net";
 
-const DRIVER_EXECUTABLE: &str = "chromedriver";
-const FFMPEG_EXECUTABLE: &str = "ffmpeg";
+#[derive(Parser, Debug, Clone)]
+#[command(version, about, long_about = None)]
+pub struct Args {
+    /// Address of the origin server to render sequences on
+    #[arg(short, long, default_value_t = {"https://onlinesequencer.net".to_owned()})]
+    pub origin: String,
 
-const RENDER_CNT: usize = 10;
+    /// Address of the server to retrieve sequences from (without the trailing slash)
+    #[arg(short, long, default_value_t = {"https://onlinesequencer.net".to_owned()})]
+    pub sequence_origin: String,
+
+    /// Path to the chromedriver executable
+    #[arg(short, long, default_value_t = {"chromedriver".to_owned()})]
+    pub driver_executable: String,
+
+    /// Path to the ffmpeg executable
+    #[arg(short, long, default_value_t = {"ffmpeg".to_owned()})]
+    pub ffmpeg_executable: String,
+
+    /// Maximum parallel renders
+    #[arg(short, long, default_value_t = 10)]
+    pub renders: u8,
+}
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum RenderStatus {
@@ -142,8 +160,8 @@ pub fn get_state() -> &'static std::sync::Mutex<HashMap<u32, RenderState>> {
     STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-pub async fn fetch_sequence(id: u32) -> Result<Bytes, Box<dyn Error>> {
-    let resp = reqwest::get(format!("{}/app/api/get_proto.php?id={}", SEQUENCE_ORIGIN, id)).await?;
+pub async fn fetch_sequence(origin: String, id: u32) -> Result<Bytes, Box<dyn Error>> {
+    let resp = reqwest::get(format!("{}/app/api/get_proto.php?id={}", origin, id)).await?;
     match resp.status() {
         reqwest::StatusCode::OK => {
             Ok(resp.bytes().await?)
@@ -178,15 +196,15 @@ pub fn find_available_port() -> u16 {
     port
 }
 
-pub async fn spawn_chromedriver(port: u16) -> Child {
-    Command::new(DRIVER_EXECUTABLE)
+pub async fn spawn_chromedriver(path: String, port: u16) -> Child {
+    Command::new(path)
         .arg(format!("--port={}", port)).spawn().unwrap()
 }
 
-pub async fn new_chromedriver_instance() -> (Sender<()>, u16) {
+pub async fn new_chromedriver_instance(path: String) -> (Sender<()>, u16) {
     let (tx, rx) = oneshot::channel();
     let port = find_available_port();
-    let mut child = spawn_chromedriver(port).await;
+    let mut child = spawn_chromedriver(path, port).await;
     tokio::spawn(async move {
         tokio::select! {
             _ = child.wait() => {},
@@ -196,7 +214,7 @@ pub async fn new_chromedriver_instance() -> (Sender<()>, u16) {
     (tx, port)
 }
 
-pub async fn new_driver(port: u16) -> Result<(Client, String), Box<dyn Error>> {
+pub async fn new_driver(instance: String, port: u16) -> Result<(Client, String), Box<dyn Error>> {
     let dir = env::current_dir()?;
     let profile_id = rand::thread_rng().next_u64().to_string();
     let profile_dir = dir.join("profiles").join(profile_id.clone());
@@ -233,13 +251,13 @@ pub async fn new_driver(port: u16) -> Result<(Client, String), Box<dyn Error>> {
 
     println!("Connected to {}", format!("{}:{}", DRIVER_ADDR, port));
 
-    client.goto(RENDER_ADDR).await?;
+    client.goto(instance.as_str()).await?;
 
     Ok((client, profile_id))
 }
 
-pub async fn convert_audio(id: u32) {
-    Command::new(FFMPEG_EXECUTABLE)
+pub async fn convert_audio(id: u32, ffmpeg_path: String) {
+    Command::new(ffmpeg_path)
         .arg("-y")
         .arg("-i").arg(format!("exports/{}.wav", id))
         .arg(format!("exports/{}.ogg", id))
@@ -258,12 +276,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     pretty_env_logger::init();
 
+    let args = Args::parse();
+
     let render_queue = Arc::new(SegQueue::new());
 
     let app = (
         warp::path!("render" / u32 / "start")
             .and(warp::post())
             .and(warp::any().map(move || render_queue.clone()))
+            .and(warp::any().map(move || args.clone()))
             .and_then(handlers::start_render)
     ).or(
         warp::path!("render" / u32 / "poll")
@@ -321,9 +342,9 @@ pub fn render_exists(id: u32) -> bool {
     Path::new(&format!("exports/{}.mp3", id)).exists()
 }
 
-pub async fn render(data: Bytes, id: u32, queue: Arc<SegQueue<()>>) -> Result<(), RenderError> {
+pub async fn render(data: Bytes, id: u32, queue: Arc<SegQueue<()>>, args: Args) -> Result<(), RenderError> {
     // Wait for space in the queue
-    while queue.len() > RENDER_CNT {
+    while queue.len() > (args.renders as usize) {
         sleep(Duration::from_millis(200)).await;
     }
     queue.pop();
@@ -333,12 +354,12 @@ pub async fn render(data: Bytes, id: u32, queue: Arc<SegQueue<()>>) -> Result<()
         m.get_mut(&id).unwrap().set_status(RenderStatus::Initializing);
     }
 
-    let (instance_handle, port) = new_chromedriver_instance().await;
+    let (instance_handle, port) = new_chromedriver_instance(args.driver_executable).await;
 
     println!("Spawned driver, waiting a moment for initialization...");
     sleep(Duration::from_millis(200)).await;
 
-    let (client, profile_id) = match new_driver(port).await {
+    let (client, profile_id) = match new_driver(args.origin.to_owned(), port).await {
         Ok(c) => c,
         Err(_) => return Err(RenderError::DriverFailure)
     };
@@ -439,7 +460,7 @@ pub async fn render(data: Bytes, id: u32, queue: Arc<SegQueue<()>>) -> Result<()
     println!("Converting audio");
 
     // convert audio
-    convert_audio(id).await;
+    convert_audio(id, args.ffmpeg_executable).await;
 
     {
         let mut m = get_state().lock().unwrap();
@@ -471,14 +492,14 @@ mod handlers {
     use tokio::time::interval;
     use tokio_stream::wrappers::IntervalStream;
     use warp::sse::Event;
-    use crate::{fetch_sequence, get_state, render, render_exists, RenderState, RenderStatus, StatusCode};
+    use crate::{Args, fetch_sequence, get_state, render, render_exists, RenderState, RenderStatus, StatusCode};
 
-    pub async fn start_render(id: u32, queue: Arc<SegQueue<()>>) -> Result<impl warp::Reply, Infallible> {
+    pub async fn start_render(id: u32, queue: Arc<SegQueue<()>>, args: Args) -> Result<impl warp::Reply, Infallible> {
         if render_exists(id) {
             return Ok(StatusCode::FOUND)
         }
 
-        let seq = match fetch_sequence(id).await {
+        let seq = match fetch_sequence(args.sequence_origin.to_owned(), id).await {
             Ok(s) => s,
             Err(_) => return Ok(StatusCode::NOT_FOUND)
         };
@@ -495,7 +516,7 @@ mod handlers {
         }
 
         queue.push(());
-        tokio::spawn(render(seq, id, queue.clone()));
+        tokio::spawn(render(seq, id, queue.clone(), args));
 
         Ok(StatusCode::OK)
     }
